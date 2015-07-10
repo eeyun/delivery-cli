@@ -128,7 +128,7 @@ fn main() {
             flag_org: ref org,
             flag_project: ref proj,
             flag_type: ref proj_type,
-            flag_edit: ref gen_skeleton,
+            flag_gen_skeleton: ref gen_skeleton,
             ..
         } => init(&user, &server, &ent, &org, &proj, &proj_type, &gen_skeleton),
         Args {
@@ -287,7 +287,7 @@ fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &
     try!(project::import(&config, &cwd));
 
     // FIXME: If the user passes in --type=cookbook
-    if proj_type == "cookbook" { //&& *gen_skeleton {
+    if proj_type == "cookbook" && *gen_skeleton {
 
         sayln("white", "Generating build cookbook skeleton");
 
