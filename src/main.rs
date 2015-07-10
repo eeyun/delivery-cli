@@ -37,6 +37,7 @@ use std::process::Command;
 use std::fs;
 
 use delivery::utils::{self, privileged_process};
+
 // Allowing this, mostly just for testing.
 #[allow(unused_imports)]
 use delivery::utils::say::{self, say, sayln};
@@ -58,7 +59,7 @@ Usage: delivery review [--for=<pipeline>] [--no-open] [--edit]
        delivery clone <project> [--user=<user>] [--server=<server>] [--ent=<ent>] [--org=<org>] [--git-url=<url>]
        delivery checkout <change> [--for=<pipeline>] [--patchset=<number>]
        delivery diff <change> [--for=<pipeline>] [--patchset=<number>] [--local]
-       delivery init [--user=<user>] [--server=<server>] [--ent=<ent>] [--org=<org>] [--project=<project>] [--type=<type>] [--gen-skeleton]
+       delivery init [--user=<user>] [--server=<server>] [--ent=<ent>] [--org=<org>] [--project=<project>] [--type=<type>] [--gen-build-cookbook]
        delivery setup [--user=<user>] [--server=<server>] [--ent=<ent>] [--org=<org>] [--config-path=<dir>] [--for=<pipeline>]
        delivery job <stage> <phase> [--change=<change>] [--for=<pipeline>] [--job-root=<dir>] [--branch=<branch_name>] [--project=<project>] [--user=<user>] [--server=<server>] [--ent=<ent>] [--org=<org>] [--patchset=<number>] [--git-url=<url>] [--shasum=<gitsha>] [--change-id=<id>] [--no-spinner]
        delivery pipeline [--for=<pipeline>] [--user=<user>] [--server=<server>] [--ent=<ent>] [--org=<org>] [--project=<project>] [--config-path=<dir>]
@@ -128,9 +129,9 @@ fn main() {
             flag_org: ref org,
             flag_project: ref proj,
             flag_type: ref proj_type,
-            flag_gen_skeleton: ref gen_skeleton,
+            flag_gen_build_cookbook: ref gen_build_cookbook,
             ..
-        } => init(&user, &server, &ent, &org, &proj, &proj_type, &gen_skeleton),
+        } => init(&user, &server, &ent, &org, &proj, &proj_type, &gen_build_cookbook),
         Args {
             cmd_checkout: true,
             arg_change: ref change,
@@ -272,7 +273,7 @@ fn setup(user: &str, server: &str, ent: &str, org: &str, path: &str, pipeline: &
 }
 
 #[allow(dead_code)]
-fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &str, gen_skeleton: &bool) -> Result<(), DeliveryError> {
+fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &str, gen_build_cookbook: &bool) -> Result<(), DeliveryError> {
     sayln("green", "Chef Delivery");
  
     let mut config = try!(load_config(&cwd()));
@@ -286,31 +287,32 @@ fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &
     let cwd = try!(env::current_dir());
     try!(project::import(&config, &cwd));
 
-    // FIXME: If the user passes in --type=cookbook
-    if proj_type == "cookbook" && *gen_skeleton {
+    if proj_type == "cookbook" && *gen_build_cookbook {
 
         sayln("white", "Generating build cookbook skeleton");
 
             // FIXME: move this into a utily module and add to token-store
-        let cached_generator_cookbooks = match env::home_dir() {
-            Some(home) => home.join_many(&[".delivery/cache/generator-cookbooks"]),
-            None => {
-                let msg = "unable to find home dir".to_string();
-                return Err(DeliveryError{ kind: Kind::NoHomedir,
-                                          detail: Some(msg) })
-            }
-        };
+        // let cached_generator_cookbooks = match env::home_dir() {
+        //     Some(home) => home.join_many(&[".delivery/cache/generator-cookbooks"]),
+        //     None => {
+        //         let msg = "unable to find home dir".to_string();
+        //         return Err(DeliveryError{ kind: Kind::NoHomedir,
+        //                                   detail: Some(msg) })
+        //     }
+        // };
 
-        sayln("white", &format!("Found directory: {:?}", &cached_generator_cookbooks));
+        let cached_generator_cookbooks = utils::home_dir(".delivery/cache/generator-cookbooks").unwrap();
+        let pcb_dir = cached_generator_cookbooks.join("pcb");
 
-        let attr = try!(fs::metadata(&cached_generator_cookbooks));
+        sayln("white", &format!("Found directory: {:?}", &pcb_dir));
+
+        let attr = try!(fs::metadata(&pcb_dir));
 
         if attr.is_dir() {
             sayln("yellow", "Cached copy of build cookbook generator exists; skipping git clone.");
         } else {
             sayln("white", "Cloning build cookbook generator into dir");
 
-            let pcb_dir = cached_generator_cookbooks.join("pcb");
 
             let clone_dir_str = pcb_dir.to_str();
 
@@ -324,7 +326,7 @@ fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &
             .arg("cookbook")
             .arg(".delivery/build-cookbook")
             .arg("-g")
-            .arg(".delivery/cache/generator-cookbooks/pcb")
+            .arg(pcb_dir)
             .output()
             .unwrap_or_else(|e| { panic!("failed to execute process: {}", e) });
 
@@ -343,7 +345,7 @@ fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &
     // if we got here, we've checked out a feature branch, added a
     // config file, and made a local commit. Let's create the review!
 
-    try!(review("master", &false, &false));
+    //try!(review("master", &false, &false));
     Ok(())
 }
 
