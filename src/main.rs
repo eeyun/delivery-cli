@@ -291,23 +291,14 @@ fn init(user: &str, server: &str, ent: &str, org: &str, proj: &str, proj_type: &
 
         sayln("white", "Generating build cookbook skeleton");
 
-            // FIXME: move this into a utily module and add to token-store
-        // let cached_generator_cookbooks = match env::home_dir() {
-        //     Some(home) => home.join_many(&[".delivery/cache/generator-cookbooks"]),
-        //     None => {
-        //         let msg = "unable to find home dir".to_string();
-        //         return Err(DeliveryError{ kind: Kind::NoHomedir,
-        //                                   detail: Some(msg) })
-        //     }
-        // };
-
-        let cached_generator_cookbooks = utils::home_dir(".delivery/cache/generator-cookbooks").unwrap();
-        let pcb_dir = cached_generator_cookbooks.join("pcb");
+        let pcb_dir =
+            utils::home_dir(".delivery/cache/generator-cookbooks/pcb")
+            .unwrap();
 
         sayln("white", &format!("Found directory: {:?}", &pcb_dir));
 
         let attr = try!(fs::metadata(&pcb_dir));
-
+        
         if attr.is_dir() {
             sayln("yellow", "Cached copy of build cookbook generator exists; skipping git clone.");
         } else {
