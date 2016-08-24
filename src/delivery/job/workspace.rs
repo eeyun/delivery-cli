@@ -27,11 +27,12 @@ use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::prelude::*;
 use utils;
+use utils::path_to_string;
 use utils::path_join_many::PathJoinMany;
+use utils::path_ext::{is_file, is_dir};
 use std::error;
 use config::Config;
 use regex::Regex;
-use utils::path_ext::{is_file, is_dir};
 
 #[derive(RustcDecodable, Debug)]
 pub struct Workspace {
@@ -103,15 +104,25 @@ impl Workspace {
         }
     }
 
+    // Build the workspace tree on the build-node
     pub fn build(&self) -> Result<(), DeliveryError> {
+        try!(self.clean_chef_nodes());
         try!(utils::mkdir_recursive(&self.root));
-        // These two directories will get chown'd to the build user,
-        // so we want to make sure they exist.
         try!(utils::mkdir_recursive(&self.chef.join("nodes")));
         try!(utils::mkdir_recursive(&self.chef.join("cookbooks")));
         try!(utils::mkdir_recursive(&self.cache));
         try!(utils::mkdir_recursive(&self.repo));
         Ok(())
+    }
+
+    // Clean the workspace::chef/nodes directory
+    //
+    // We have to clean the `nodes/` directory since `chef-zero`
+    // will merge the old attributes with the new ones of the
+    // coming change.
+    pub fn clean_chef_nodes(&self) -> Result<(), DeliveryError> {
+       try!(utils::remove_recursive(&self.chef.join("nodes")));
+       Ok(())
     }
 
     fn reset_repo(&self, git_ref: &str) -> Result<(), DeliveryError> {
@@ -152,11 +163,19 @@ impl Workspace {
                     detail: Some("Build cookbook 'path' value must be a string".to_string())
                 })
             };
+            let site = match build_cookbook.find("site") {
+                Some(s) => try!(s.as_string().ok_or(DeliveryError{
+                    kind: Kind::ExpectedJsonString,
+                    detail: Some("Expected 'site' value to be a string".to_string())
+                })),
+                None => "https://supermarket.chef.io"
+            };
             let result = try!(utils::make_command("knife")
-                 .arg("cookbook")
-                 .arg("site")
+                 .arg("supermarket")
                  .arg("download")
                  .arg(&name)
+                 .arg("-m")
+                 .arg(&site)
                  .arg("-f")
                  .arg(&path_to_string(&self.chef.join("build_cookbook.tgz")))
                  .current_dir(&self.root)
@@ -164,7 +183,7 @@ impl Workspace {
             if ! result.status.success() {
                 let output = String::from_utf8_lossy(&result.stdout);
                 let error = String::from_utf8_lossy(&result.stderr);
-                return Err(DeliveryError{kind: Kind::SupermarketFailed, detail: Some(format!("Failed 'knife cookbook site download'\nOUT: {}\nERR: {}", &output, &error).to_string())});
+                return Err(DeliveryError{kind: Kind::SupermarketFailed, detail: Some(format!("Failed 'knife supermarket download'\nOUT: {}\nERR: {}\nSite: {}", &output, &error, &site).to_string())});
             }
             let tar_result = try!(utils::make_command("tar")
                  .arg("zxf")
@@ -299,6 +318,7 @@ impl Workspace {
     fn berks_vendor(&self, config: &Json) -> Result<(), DeliveryError> {
         try!(utils::remove_recursive(&self.chef.join("cookbooks")));
         if is_file(&self.chef.join_many(&["build_cookbook", "Berksfile"])) {
+            debug!("Running 'berks vendor cookbooks' inside the build_cookbooks");
             let mut command = utils::make_command("berks");
             command.arg("vendor");
             command.arg(&self.chef.join("cookbooks"));
@@ -498,31 +518,52 @@ impl Workspace {
 
 }
 
-// Convert a path into a String. Panic if the path contains
-// non-unicode sequences.
-fn path_to_string(p: &Path) -> String {
-    match p.to_str() {
-        Some(s) => s.to_string(),
-        None => {
-            let s = format!("invalid path (non-unicode): {}",
-                            p.to_string_lossy());
-            panic!(s)
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::fs::File;
+    use utils;
+    use utils::path_ext::{is_dir, is_file};
     use std::path::PathBuf;
 
     #[test]
-    fn new() {
+    fn test_workspace_new() {
         let root = PathBuf::from("clown");
         let w = Workspace::new(&root);
         assert_eq!(w.root, root);
         assert_eq!(w.chef, root.join("chef"));
         assert_eq!(w.cache, root.join("cache"));
         assert_eq!(w.repo, root.join("repo"));
+    }
+
+    #[test]
+    fn test_workspace_build() {
+        let root = PathBuf::from("/tmp/cli-workspace-build");
+        let w = Workspace::new(&root);
+        assert!(w.build().is_ok(), "The workspace build process failed");
+        assert!(is_dir(&w.root));
+        assert!(is_dir(&w.chef));
+        assert!(is_dir(&w.chef.join("nodes")));
+        assert!(is_dir(&w.cache));
+        assert!(is_dir(&w.repo));
+        // Remove temp cli workspace
+        utils::remove_recursive(&root).unwrap();
+    }
+
+    #[test]
+    fn test_workspace_build_and_clean_chef_nodes() {
+        let root = PathBuf::from("/tmp/cli-workspace-clean");
+        let w = Workspace::new(&root);
+        assert!(w.build().is_ok(), "The workspace build process failed");
+        // This is an empty workspace, lets lay down a file
+        // inside chef/nodes and test it exists, then after
+        // running build() again it shouldn't exist anymore.
+        let nfile = w.chef.join("nodes").join("test.node");
+        let _ = File::create(nfile.clone());
+        assert!(is_file(&nfile));
+        assert!(w.build().is_ok());
+        assert_eq!(false, is_file(&nfile));
+        // Remove temp cli workspace
+        utils::remove_recursive(&root).unwrap();
     }
 }

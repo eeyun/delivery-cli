@@ -1,5 +1,5 @@
 //
-// Copyright:: Copyright (c) 2015 Chef Software, Inc.
+// Copyright:: Copyright (c) 2016 Chef Software, Inc.
 // License:: Apache License, Version 2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,25 +17,38 @@
 
 use rustc_serialize::json;
 use std::error::{self, Error};
+use std::num;
 use std::io;
 use std::fmt;
 use hyper;
+use toml;
 use hyper::error::Error as HttpError;
 
 #[derive(Debug)]
 pub enum Kind {
+    ChangeNotFound,
+    PhaseNotFound,
     AuthenticationFailed,
+    InternalServerError,
     NoMatchingCommand,
     NotOnABranch,
     CannotReviewSameBranch,
     FailedToExecute,
     PushFailed,
     BadGitOutputMatch,
-    NoConfig,
+    MissingMetadataVersion,
+    BadMetadataVersionMatch,
+    NoGitConfig,
+    NoDeliveryConfig,
+    NoBitbucketSCPConfig,
+    NoGithubSCPConfig,
+    OptionConstraint,
+    UnknownProjectType,
     GitFailed,
     GitSetupFailed,
     ConfigParse,
     MissingConfig,
+    MissingConfigFile,
     ConfigValidation,
     IoError,
     JsonError,
@@ -61,8 +74,11 @@ pub enum Kind {
     UnsupportedProtocol,
     ApiError(hyper::status::StatusCode, Result<String, io::Error>),
     JsonParseError,
+    TomlDecodeError,
+    IntParseError,
     OpenFailed,
     NoToken,
+    TokenExpired,
     NoEditor,
     MissingProjectConfig
 }
@@ -82,6 +98,8 @@ impl DeliveryError {
 impl error::Error for DeliveryError {
     fn description(&self) -> &str {
         match self.kind {
+            Kind::ChangeNotFound => "GET failed for specific change",
+            Kind::PhaseNotFound => "Phase not implemented",
             Kind::NoMatchingCommand => "No command matches your arguments - likely unimplemented feature",
             Kind::NotOnABranch => "You must be on a branch",
             Kind::CannotReviewSameBranch => "You cannot target code for review from the same branch as the review is targeted for",
@@ -90,9 +108,17 @@ impl error::Error for DeliveryError {
             Kind::GitFailed => "Git command failed!",
             Kind::GitSetupFailed => "Setup failed; you have already set up delivery.",
             Kind::BadGitOutputMatch => "A line of git porcelain did not match!",
-            Kind::NoConfig => "Cannot find a .git/config file",
+            Kind::BadMetadataVersionMatch => "Metadata version mismatch!",
+            Kind::MissingMetadataVersion => "Missing a version entry into the metadata.rb",
+            Kind::NoGitConfig => "Cannot find a .git/config file. Run 'git init' in your project root to initialize it.",
+            Kind::NoDeliveryConfig => "Cannot find a .delivery/config.json file.",
+            Kind::NoBitbucketSCPConfig => "Bitbucket Source Code Provider configuration not found; a Delivery administrator must first configure the link with Bitbucket",
+            Kind::NoGithubSCPConfig => "Github Source Code Provider configuration not found; a Delivery administrator must first configure the link with Github",
+            Kind::OptionConstraint => "Invalid option constraint",
+            Kind::UnknownProjectType => "Unknown Project Type",
             Kind::ConfigParse => "Failed to parse the cli config file",
             Kind::MissingConfig => "A configuration value is missing",
+            Kind::MissingConfigFile => "Could not find the configuration file.",
             Kind::ConfigValidation => "A required option is missing - use the command line options or 'delivery setup'",
             Kind::IoError => "An I/O Error occurred",
             Kind::JsonError => "A JSON Parser error occured",
@@ -118,9 +144,13 @@ impl error::Error for DeliveryError {
             Kind::HttpError(_) => "An HTTP Error occured",
             Kind::ApiError(_, _) => "An API Error occured",
             Kind::JsonParseError => "Attempted to parse invalid JSON",
+            Kind::TomlDecodeError => "Attempted to decode invalid TOML",
+            Kind::IntParseError => "Attempted to parse invalid Int",
             Kind::OpenFailed => "Open command failed",
             Kind::AuthenticationFailed => "Authentication failed",
+            Kind::InternalServerError => "There was an internal error on the server. Check the logson the Delivery server.",
             Kind::NoToken => "Missing API token. Try `delivery token` to create one",
+            Kind::TokenExpired => "The API token has expired. Try `delivery token` to generate a new one",
             Kind::NoEditor => "Environment variable EDITOR not set",
             Kind::MissingProjectConfig => "Unable to find .delivery/config.json in this directory or its parents"
         }
@@ -188,6 +218,25 @@ impl From<HttpError> for DeliveryError {
         DeliveryError{
             kind: Kind::HttpError(err),
             detail: detail
+        }
+    }
+}
+
+impl From<num::ParseIntError> for DeliveryError {
+    fn from(err: num::ParseIntError) -> DeliveryError {
+        let detail = Some(err.description().to_string());
+        DeliveryError{
+            kind: Kind::IntParseError,
+            detail: detail
+        }
+    }
+}
+
+impl From<toml::DecodeError> for DeliveryError {
+    fn from(err: toml::DecodeError) -> DeliveryError {
+        DeliveryError{
+            kind: Kind::TomlDecodeError,
+            detail: Some(format!("{}: {}", err.description().to_string(), err))
         }
     }
 }

@@ -28,8 +28,17 @@ extern crate uuid;
 #[macro_use] extern crate hyper;
 extern crate mime;
 extern crate clap;
+extern crate crypto;
+
+#[macro_export]
+macro_rules! validate {
+    ($config:ident, $value:ident) => (
+        try!($config.$value());
+    )
+}
 
 pub mod errors;
+pub mod types;
 pub mod git;
 pub mod utils;
 pub mod config;
@@ -39,4 +48,6 @@ pub mod getpass;
 pub mod token;
 pub mod http;
 pub mod project;
+pub mod cookbook;
 pub mod cli;
+pub mod command;

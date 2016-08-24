@@ -27,11 +27,12 @@ use rustc_serialize::json;
 use rustc_serialize::json::DecoderError;
 
 use errors::{DeliveryError, Kind};
+use types::DeliveryResult;
 use git;
-use utils::{mkdir_recursive, walk_tree_for_path};
+use utils::{walk_tree_for_path, read_file, copy_recursive, file_needs_updated};
 use utils::path_join_many::PathJoinMany;
-use utils::say::{say, sayln};
-use utils::path_ext::{is_dir, is_file};
+
+pub mod project;
 
 #[derive(RustcEncodable, RustcDecodable, Clone)]
 pub struct DeliveryConfig {
@@ -55,9 +56,9 @@ impl Default for DeliveryConfig {
     fn default() -> DeliveryConfig {
         let mut build_cookbook = HashMap::new();
         build_cookbook.insert("name".to_string(),
-                              "build-cookbook".to_string());
+                              "build_cookbook".to_string());
         build_cookbook.insert("path".to_string(),
-                              ".delivery/build-cookbook".to_string());
+                              ".delivery/build_cookbook".to_string());
         DeliveryConfig {
             version: "2".to_string(),
             build_cookbook: build_cookbook,
@@ -69,46 +70,50 @@ impl Default for DeliveryConfig {
 }
 
 impl DeliveryConfig {
-    pub fn init(proj_path: &PathBuf) -> Result<(), DeliveryError> {
-        if DeliveryConfig::config_file_exists(proj_path) {
-            debug!("Delivery config file already exists, skipping");
-            return Ok(())
+    /// Copy a provided `config.json` file to `.delivery/` of
+    /// the project root path. Also verify that the config is
+    /// valid and finally add/commit the changes.
+    /// If the config already exists, skip this process.
+    pub fn copy_config_file(config_f: &PathBuf,
+                            proj_path: &PathBuf) -> DeliveryResult<Option<String>> {
+        let write_path = DeliveryConfig::config_file_path(proj_path);
+
+        // If a config.json already exists, check to see if it is exactly
+        // the same as what we want to copy to it.
+        if !try!(file_needs_updated(config_f, &write_path)) {
+            return Ok(None)
         }
 
-        debug!("proj_path: {:?}\n", proj_path);
-        debug!("Creating a new config file");
+        try!(copy_recursive(config_f, &write_path));
+        try!(DeliveryConfig::validate_config_file(proj_path));
+        let content = try!(read_file(&write_path));
+        Ok(Some(content))
+    }
 
-        let config = DeliveryConfig::default();
-        try!(config.write_file(proj_path));
+    pub fn git_add_commit_config(proj_path: &PathBuf) -> DeliveryResult<()> {
         let config_path = DeliveryConfig::config_file_path(proj_path);
         let config_path_str = &config_path.to_str().unwrap();
-        try!(git::git_command(&["checkout", "-b", "add-delivery-config"], proj_path));
         try!(git::git_command(&["add", &config_path_str], proj_path));
-        try!(git::git_command(&["commit", "-m", "Add Delivery config"], proj_path));
+        try!(git::git_command(&["commit", "-m", "Adds custom Delivery config"], proj_path));
         Ok(())
     }
 
-    fn config_file_path(proj_path: &PathBuf) -> PathBuf {
+    pub fn config_file_path(proj_path: &PathBuf) -> PathBuf {
         proj_path.join_many(&[".delivery", "config.json"])
     }
 
-    fn config_file_exists(proj_path: &PathBuf) -> bool {
-        is_file(&DeliveryConfig::config_file_path(proj_path))
-    }
-
-    fn find_config_file(proj_path: &PathBuf) -> Result<PathBuf, DeliveryError> {
+    fn find_config_file(proj_path: &PathBuf) -> DeliveryResult<PathBuf> {
         match walk_tree_for_path(proj_path, ".delivery/config.json") {
             Some(p) => {
                 debug!("found config: {:?}", p);
                 Ok(p)
             },
             None => Err(DeliveryError{kind: Kind::MissingProjectConfig,
-                                      detail: Some(format!("current directory: {:?}",
-                                                           proj_path))})
+                                      detail: None})
         }
     }
 
-    pub fn validate_config_file(proj_path: &PathBuf) -> Result<bool, DeliveryError> {
+    pub fn validate_config_file(proj_path: &PathBuf) -> DeliveryResult<bool> {
         let config_file_path = try!(DeliveryConfig::find_config_file(proj_path));
         let mut config_file = try!(File::open(&config_file_path));
         let mut config_file_content = String::new();
@@ -132,21 +137,4 @@ impl DeliveryConfig {
         Ok(boolean_result)
     }
 
-    fn write_file(&self, proj_path: &PathBuf) -> Result<(), DeliveryError> {
-        let write_dir = proj_path.join_many(&[".delivery"]);
-        if !is_dir(&write_dir) {
-            try!(mkdir_recursive(&write_dir));
-        }
-        let write_path = DeliveryConfig::config_file_path(proj_path);
-        say("white", "Writing configuration to ");
-        sayln("yellow", &format!("{}", write_path.display()));
-        let mut f = try!(File::create(&write_path));
-        let json_obj = json::as_pretty_json(&self);
-        let json_string = format!("{}", json_obj);
-        sayln("magenta", "New delivery configuration");
-        sayln("magenta", "--------------------------");
-        sayln("white", &json_string);
-        try!(f.write_all(json_string.as_bytes()));
-        Ok(())
-    }
 }

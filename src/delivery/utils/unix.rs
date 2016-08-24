@@ -17,7 +17,8 @@
 
 use std::process::Command;
 use errors::{DeliveryError, Kind};
-use libc::funcs::posix88::unistd;
+use libc;
+use utils::path_to_string;
 use std::path::Path;
 use std::convert::AsRef;
 use std::error;
@@ -101,7 +102,7 @@ pub fn chown_all<P: AsRef<Path>>(who: &str,
 }
 
 pub fn privileged_process() -> bool {
-    match unsafe { unistd::getuid() } {
+    match unsafe { libc::getuid() } {
         0 => true,
         _ => false
     }
@@ -114,14 +115,3 @@ pub fn make_command(cmd: &str) -> Command {
     Command::new(cmd)
 }
 
-fn path_to_string<P: AsRef<Path>>(p: P) -> String {
-    let path = p.as_ref();
-    match path.to_str() {
-        Some(s) => s.to_string(),
-        None => {
-            let s = format!("invalid path (non-unicode): {}",
-                            path.to_string_lossy());
-            panic!(s)
-        }
-    }
-}

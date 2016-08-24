@@ -5,7 +5,7 @@
 .bundle
 bin/
 vendor/
-/omnibus-delivery-cli/local/
+/omnibus/local/
 nodes/
 local-mode-cache
 
@@ -16,3 +16,6 @@ bin/
 tmp/
 /cookbooks/delivery_rust/cookbooks/
 /cookbooks/delivery_rust/nodes/
+/omnibus/Berksfile.lock
+/omnibus/Gemfile.lock
+cookbooks/delivery_rust/Berksfile.lock

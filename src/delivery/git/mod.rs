@@ -252,14 +252,14 @@ fn parse_line_from_remote(line: &str, review_result: &mut ReviewResult) -> () {
     }
 }
 
-pub fn init_repo(path: &PathBuf) -> Result<(), DeliveryError> {
+pub fn check_repo_init(path: &PathBuf) -> Result<(), DeliveryError> {
     say("white", "Is ");
     say("magenta", &format!("{} ", path.display()));
     say("white", "a git repo?  ");
 
-    let git_dir = Path::new("./.git");
+    let git_dir = path.join(".git");
 
-    if is_dir(git_dir) {
+    if is_dir(git_dir.as_path()) {
         sayln("white", "yes");
         return Ok(())
     } else {
@@ -284,7 +284,6 @@ pub fn create_repo(path: &PathBuf) -> Result<(), DeliveryError> {
 }
 
 pub fn config_repo(url: &str, path: &PathBuf) -> Result<bool, DeliveryError> {
-    sayln("white", &format!("adding remote delivery: {}", &url));
     let result = git_command(&["remote", "add", "delivery", &url], path);
     match result {
         Ok(_) => return Ok(true),
@@ -292,7 +291,22 @@ pub fn config_repo(url: &str, path: &PathBuf) -> Result<bool, DeliveryError> {
             match e.detail.clone() {
                 Some(msg) => {
                     if msg.contains("remote delivery already exists") {
-                        return Ok(false);
+                        // Check to see if the current delivery git remote matches
+                        // the url passed in.
+                        let git_version_result = git_command(&["remote", "-v", "show", "-n", "delivery"], path);
+                        match git_version_result {
+                            Ok(git_result) => {
+                                if git_result.stdout.contains(url) {
+                                    return Ok(false);
+                                } else {
+                                    return Err(DeliveryError {
+                                        kind: Kind::GitFailed,
+                                        detail: Some(remote_already_exists_error_msg(url))
+                                    });
+                                }
+                            },
+                            Err(e) => return Err(e)
+                        }
                     } else {
                         return Err(e)
                     }
@@ -303,6 +317,11 @@ pub fn config_repo(url: &str, path: &PathBuf) -> Result<bool, DeliveryError> {
             }
         },
     }
+}
+
+fn remote_already_exists_error_msg(url: &str) -> String {
+    let error = "A git remote named 'delivery' already exists in this repo, but it is different than what was contained in your config file:\n\n".to_string() + url;
+    return error + "\n\nPlease either update your cli.toml or your git remote. Run:\n\ngit remote -v show -n delivery\n\nto see your current delivery remote."
 }
 
 pub fn checkout_branch_name(change: &str, patchset: &str) -> String {
@@ -360,52 +379,92 @@ pub fn checkout_review(change: &str, patchset: &str, pipeline: &str) -> Result<(
     }
 }
 
-pub fn server_content() -> bool {
-    match git_command(&["ls-remote", "delivery", "refs/heads/master"], &cwd()) {
+// Verify the content of the repo:pipeline on the server
+pub fn server_content(pipeline: &str) -> Result<bool, DeliveryError> {
+    let p_ref = &format!("refs/heads/{}", pipeline);
+    match git_command(&["ls-remote", "delivery", p_ref], &cwd()) {
         Ok(msg) => {
-            if msg.stdout.contains("refs/heads/master") {
-                say("red", &format!("{}", msg.stdout));
-                return true
+            if msg.stdout.contains(p_ref) {
+                return Ok(true)
             } else {
-                sayln("white", "No upstream content");
-                return false
+                return Ok(false)
             }
         },
-        Err(e) => {
-            sayln("red", &format!("got error {:?}", e));
-            return false
-        }
+        Err(e) => return Err(e)
     }
 }
 
-pub fn git_push_master() -> Result<(), DeliveryError> {
-    match git_command(&["push", "--set-upstream",
-                       "--porcelain", "--progress",
-                       "--verbose", "delivery", "master"],
-                      &cwd()) {
+// Push pipeline content to the Server
+pub fn git_push(pipeline: &str) -> Result<(), DeliveryError> {
+    // Check if the pipeline branch exists and has commits.
+    // If the pipeline branch exists and does not have commits,
+    // then `git branch` will not return it, so just checking
+    // `git branch` output will handle both cases (pipeline does
+    // not exist and pipeline exists but without commits).
+    match git_command(&["branch"], &cwd()) {
         Ok(msg) => {
-            sayln("white", &format!("{}", msg.stdout));
-            return Ok(())
-        },
-        Err(e) => {
-            match e.detail {
-                Some(msg) => {
-                    if msg.contains("failed to push some refs") {
-                        sayln("red", &format!("Failed to push; perhaps there are no local commits?"));
-                    }
-                    return Ok(())
-                },
-                None => {
-                    return Err(e)
-                }
+            if !msg.stdout.contains(pipeline) {
+                sayln("red", &format!("A {} branch does not exist locally.", pipeline));
+                sayln("red", &format!("A {} branch with commits is needed to create the {} \
+                                      pipeline.\n", pipeline, pipeline));
+                sayln("red", &format!("If your project already has git history, you should \
+                                      pull it into {} locally.", pipeline));
+                sayln("red", &format!("For example, if your remote is named origin, and your \
+                                      git history is in {} run:\n", pipeline));
+                sayln("red", &format!("git pull origin {}\n", pipeline));
+                sayln("red", "However, if this is a brand new project, make an initial commit by running:\n");
+                sayln("red", &format!("git checkout -b {}", pipeline));
+                sayln("red", "git commit --allow-empty -m 'Initial commit.'\n");
+                sayln("red", &format!("Once you have commits on the {} branch, run `delivery \
+                                      init` again.", pipeline));
+                return Err(DeliveryError{ kind: Kind::GitFailed, detail: None });
             }
-        }
+            true
+        },
+        Err(e) => return Err(e)
+    };
+
+    // Master branch exists with commits on it, push it up so the master pipeline can be made.
+    match git_command(&["push", "--set-upstream",
+                        "--porcelain", "--progress",
+                        "--verbose", "delivery", pipeline],
+                      &cwd()) {
+        Ok(_) => return Ok(()),
+        // Not expecting any errors at this point.
+        Err(e) => return Err(e)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewResult, parse_line_from_remote};
+    use super::{ReviewResult, parse_line_from_remote, check_repo_init};
+    use std::path::PathBuf;
+    use std::fs::DirBuilder;
+
+    #[test]
+    fn test_check_repo_init_with_invalid_path() {
+        let path = PathBuf::from("/tmp/not_real");
+        assert!(check_repo_init(&path).is_err());
+    }
+
+    #[test]
+    fn test_check_repo_init_with_valid_path_no_git() {
+        let path = PathBuf::from("/tmp/real1");
+        DirBuilder::new()
+            .recursive(true)
+            .create(&path).unwrap();
+        assert!(check_repo_init(&path).is_err());
+    }
+
+    #[test]
+    fn test_check_repo_init_with_valid_path() {
+        let path = PathBuf::from("/tmp/real2/");
+        let full_path = path.join(".git");
+        DirBuilder::new()
+            .recursive(true)
+            .create(&full_path).unwrap();
+        assert!(check_repo_init(&path).is_ok());
+    }
 
     #[test]
     fn test_parse_line_from_remote() {

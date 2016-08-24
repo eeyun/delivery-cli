@@ -22,18 +22,21 @@ use hyper;
 use hyper::status::StatusCode;
 use hyper::client::response::Response as HyperResponse;
 use hyper::error::Error as HttpError;
+use http;
+use http::token::TokenResponse;
 use mime;
 use rustc_serialize::json;
-use errors::Kind as DelivError;
 use std::io::prelude::*;
 use errors::{DeliveryError, Kind};
 use token::TokenStore;
 use utils::say::sayln;
 use config::Config;
+use types::DeliveryResult;
 
 mod headers;
 pub mod token;
 pub mod change;
+pub mod saml;
 
 #[derive(Debug)]
 enum HProto {
@@ -42,7 +45,7 @@ enum HProto {
 }
 
 impl HProto {
-    pub fn from_str(p: &str) -> Result<HProto, DeliveryError> {
+    pub fn from_str(p: &str) -> DeliveryResult<HProto> {
         let lp = p.to_lowercase();
         match lp.as_ref() {
             "http" => Ok(HProto::HTTP),
@@ -83,13 +86,12 @@ pub struct APIClient {
 }
 
 impl APIClient {
-
     /// Create a new `APIClient` from the specified `Config` instance
     /// for making authenticated requests. Returns an error result if
     /// required configuration values are missing. Expects to find
     /// `server`, `api_port`, `enterprise`, and `user` in the config
     /// along with a token mapped for those values.
-    pub fn from_config(config: &Config) -> Result<APIClient, DeliveryError> {
+    pub fn from_config(config: &Config) -> DeliveryResult<APIClient> {
         APIClient::from_config_no_auth(config).and_then(|mut c| {
             let auth = try!(APIAuth::from_config(&config));
             c.set_auth(auth);
@@ -104,7 +106,7 @@ impl APIClient {
     /// `api_port`, and `enterprise` from the specified config and
     /// raise an error if any of these values are unset.
     pub fn from_config_no_auth(config: &Config)
-                               -> Result<APIClient, DeliveryError> {
+                               -> DeliveryResult<APIClient> {
         let host = try!(config.api_host_and_port());
         let ent = try!(config.enterprise());
         let proto_str = try!(config.api_protocol());
@@ -133,7 +135,49 @@ impl APIClient {
         }
     }
 
-    pub fn get_auth_from_home(&mut self, server: &str, ent: &str, user: &str) -> Result<APIAuth, DeliveryError> {
+    /// Parse the HyperResponse coming from a APIClient Request that
+    /// Delivery sends back when hitting an endpoints. It will
+    /// interprete the response by, either printing a message and
+    /// returning Ok() or throwing an Err() if we don't know it
+    pub fn parse_response(&self, mut response: HyperResponse) -> DeliveryResult<StatusCode> {
+        debug!("Parsing response with status: {:?}", response.status);
+        match response.status {
+            StatusCode::NoContent => Ok(response.status),
+            StatusCode::Created => {
+                debug!(" created");
+                Ok(response.status)
+            },
+            StatusCode::Conflict => {
+                debug!(" already exists.");
+                Ok(response.status)
+            },
+            StatusCode::Unauthorized => {
+                let detail = try!(APIClient::extract_pretty_json(&mut response));
+                if TokenResponse::parse_token_expired(&detail) {
+                    Err(DeliveryError{ kind: Kind::TokenExpired, detail: None})
+                } else {
+                    let mut msg = "API request returned 401\nDetails:\n".to_string();
+                    msg.push_str(&detail);
+                    Err(DeliveryError{ kind: Kind::AuthenticationFailed,
+                                       detail: Some(msg)})
+                }
+            },
+            error_code @ _ => {
+                let msg = format!("API request returned {}",
+                                  error_code);
+                let mut detail = String::new();
+                let e = match response.read_to_string(&mut detail) {
+                    Ok(_) => Ok(detail),
+                    Err(e) => Err(e)
+                };
+                Err(DeliveryError{ kind: Kind::ApiError(error_code, e),
+                                   detail: Some(msg)})
+            }
+        }
+    }
+
+    pub fn get_auth_from_home(&mut self, server: &str, ent: &str,
+                              user: &str) -> DeliveryResult<APIAuth> {
         match TokenStore::from_home() {
             Ok(tstore) => {
                 APIAuth::from_token_store(tstore, server, ent, user)
@@ -169,10 +213,10 @@ impl APIClient {
         self.req_with_body(HTTPMethod::POST, path, payload)
     }
 
-    // Send a request using the specified HTTP verb. If `payload` is
-    // an empty string, no request body will be sent. This could be an
-    // `Options<String>` but (I think) keeping the simple `&str`
-    // avoids an allocation.
+    /// Send a request using the specified HTTP verb. If `payload` is
+    /// an empty string, no request body will be sent. This could be an
+    /// `Options<String>` but (I think) keeping the simple `&str`
+    /// avoids an allocation.
     fn req_with_body(&self,
                      http_method: HTTPMethod,
                      path: &str,
@@ -193,10 +237,33 @@ impl APIClient {
             },
             None => req
         };
-        if !payload.is_empty() {
-            req.body(payload).send()
-        } else {
+        debug!("Request: {:?} Path: {:?} Payload: {:?}",
+                http_method, path, payload);
+        if payload.is_empty() {
             req.send()
+        } else {
+            req.body(payload).send()
+        }
+    }
+
+    pub fn pipeline_exists(&self,
+                          org: &str, proj: &str, pipe: &str) -> bool {
+        let path = format!("orgs/{}/projects/{}/pipelines/{}", org, proj, pipe);
+        match self.get(&path) {
+            Ok(res) => {
+                match res.status {
+                    StatusCode::Ok => {
+                        return true;
+                    },
+                    _ => {
+                        return false;
+                    }
+                }
+            },
+            Err(e) => {
+                sayln("red", &format!("pipeline_exists: HttpError: {:?}", e));
+                return false;
+            }
         }
     }
 
@@ -223,62 +290,96 @@ impl APIClient {
         }
     }
 
-    pub fn create_project(&self,
-                          org: &str,
-                          proj: &str) -> Result<HyperResponse, DelivError> {
+    pub fn create_delivery_project(&self, org: &str,
+                                   proj: &str) -> DeliveryResult<StatusCode> {
         let path = format!("orgs/{}/projects", org);
         // FIXME: we'd like to use the native struct->json stuff, but
         // seeing link issues.
         let payload = format!("{{\"name\":\"{}\"}}", proj);
-        match self.post(&path, &payload) {
-            Ok(mut res) => {
-                match res.status {
-                    StatusCode::Created =>
-                        Ok(res),
-                    _ => {
-                        let mut detail = String::new();
-                        let e = match res.read_to_string(&mut detail) {
-                            Ok(_) => Ok(detail),
-                            Err(e) => Err(e)
-                        };
-                        Err(DelivError::ApiError(res.status, e))
+        self.parse_response(try!(self.post(&path, &payload)))
+    }
+
+    pub fn create_github_project(&self, org: &str, proj: &str,
+                                repo_name: &str, git_org: &str, pipe: &str,
+                                ssl: bool) -> DeliveryResult<StatusCode> {
+        let path = format!("orgs/{}/github-projects", org);
+        let payload = format!("{{\
+                                \"name\":\"{}\",\
+                                \"scm\":{{\
+                                    \"type\":\"github\",\
+                                    \"project\":\"{}\",\
+                                    \"organization\":\"{}\",\
+                                    \"branch\":\"{}\",\
+                                    \"verify_ssl\": {}\
+                                }}\
+                              }}", proj, repo_name, git_org, pipe, ssl);
+        self.parse_response(try!(self.post(&path, &payload)))
+    }
+
+    fn get_scm_server_config(&self, scm: &str) -> DeliveryResult<Vec<json::Json>> {
+        let json = try!(APIClient::parse_json(self.get("scm-providers")));
+        debug!("Endpoint[scm-providers]: {:?}", json);
+        if let Some(data) = json.as_array() {
+            for obj in data.iter() {
+                if let Some(scp) = obj.as_object() {
+                    let name = scp.get("name").unwrap().as_string().unwrap();
+                    if name == scm {
+                        let scp_config = scp.get("scmSetupConfigs").unwrap().as_array().unwrap();
+                        debug!("{:?} Config: {:?}", scm, scp_config);
+                        return Ok(scp_config.clone())
                     }
                 }
-            },
-            Err(e) => Err(DelivError::HttpError(e))
+            }
         }
+        Err(DeliveryError {
+            kind: Kind::ExpectedJsonString,
+            detail: Some(format!("Unable to find {:?} SCM Config in Delivery Server.\n\
+                                 JSON Output: {:?}", scm, json))
+        })
+    }
+
+    pub fn get_github_server_config(&self) -> DeliveryResult<Vec<json::Json>> {
+        self.get_scm_server_config("Github")
+    }
+
+    pub fn get_bitbucket_server_config(&self) -> DeliveryResult<Vec<json::Json>> {
+        self.get_scm_server_config("Bitbucket")
+    }
+
+    pub fn create_bitbucket_project(&self, org: &str, proj: &str,
+                                    repo_name: &str, project_key: &str,
+                                    pipe: &str) -> DeliveryResult<StatusCode> {
+        let path = format!("orgs/{}/bitbucket-projects", org);
+        let payload = format!("{{\
+                                \"name\":\"{}\",\
+                                \"scm\":{{\
+                                    \"type\":\"bitbucket\",\
+                                    \"repo_name\":\"{}\",\
+                                    \"project_key\":\"{}\",\
+                                    \"pipeline_branch\":\"{}\"\
+                                }}\
+                              }}", proj, repo_name, project_key, pipe);
+        // Sadly the endpoint returns a Status 204 NoContent instead of 201 Created
+        // therefore we need to hardcode the output of the sayln(" created)"
+        //
+        self.parse_response(try!(self.post(&path, &payload)))
+        // TODO: Fix the endpoint, delete this code and uncomment this line:
+        //self.parse_response(try!(self.post(&path, &payload)))
     }
 
     pub fn create_pipeline(&self,
-                           org: &str,
-                           proj: &str,
-                           pipe: &str) -> Result<HyperResponse, DelivError> {
+                           org: &str, proj: &str,
+                           pipe: &str, base: Option<&str>) -> DeliveryResult<StatusCode> {
         let path = format!("orgs/{}/projects/{}/pipelines", org, proj);
-        // FIXME: we'd like to use the native struct->json stuff, but
-        // seeing link issues.
-        let base_branch = "master";
-        let payload = format!("{{\"name\":\"{}\",\"base\":\"{}\"}}",
-                              pipe, base_branch);
-        match self.post(&path, &payload) {
-            Ok(mut res) => {
-                match res.status {
-                    StatusCode::Created =>
-                        Ok(res),
-                    _ => {
-                        let mut detail = String::new();
-                        let e = match res.read_to_string(&mut detail) {
-                            Ok(_) => Ok(detail),
-                            Err(e) => Err(e)
-                        };
-                        Err(DelivError::ApiError(res.status, e))
-                    }
-                }
-            },
-            Err(e) => Err(DelivError::HttpError(e))
-        }
+
+        // We unwrap the provided base branch, if None we default to `master`
+        let base_branch = base.unwrap_or("master");
+        let payload = format!("{{\"name\":\"{}\",\"base\":\"{}\"}}", pipe, base_branch);
+
+        self.parse_response(try!(self.post(&path, &payload)))
     }
 
-    pub fn parse_json(result: Result<HyperResponse, HttpError>) -> Result<json::Json, DeliveryError> {
+    pub fn parse_json(result: Result<HyperResponse, HttpError>) -> DeliveryResult<json::Json> {
         let body = match result {
             Ok(mut b) => {
                 let mut body_string = String::new();
@@ -292,9 +393,10 @@ impl APIClient {
     }
 
     pub fn extract_pretty_json(resp: &mut HyperResponse) ->
-        Result<String, DeliveryError> {
+        DeliveryResult<String> {
             let mut body = String::new();
             try!(resp.read_to_string(&mut body));
+            debug!("Status: {:?} Body: {:?}", resp.status, body);
             let json = try!(json::Json::from_str(&body));
             Ok(format!("{}", json.pretty()))
     }
@@ -325,7 +427,11 @@ impl APIAuth {
     /// `enterprise`, and `user`.
     /// Reads API tokens from `$HOME/.delivery/api-tokens`.
     /// Lookup for the stored token, if it does not exist request it.
-    pub fn from_config(config: &Config) -> Result<APIAuth, DeliveryError> {
+    pub fn from_config(config: &Config) -> DeliveryResult<APIAuth> {
+        if !try!(http::token::verify(&config)) {
+            sayln("red", "Token expired");
+            return APIAuth::from_token_request(config)
+        }
         let tstore = match config.token_file {
             Some(ref f) => {
                 let file = PathBuf::from(f);
@@ -336,34 +442,42 @@ impl APIAuth {
         let api_server = try!(config.api_host_and_port());
         let ent = try!(config.enterprise());
         let user = try!(config.user());
-        let api_auth = APIAuth::from_token_store(tstore, &api_server,
-                                                 &ent, &user);
-        api_auth.or_else(|e| {
-            let interactive = !config.non_interactive.unwrap_or(false);
-            if interactive {
-                let token = try!(TokenStore::request_token(&config));
-                Ok(APIAuth{ user: user.clone(),
-                            token: token.clone()})
-            } else {
-                Err(e)
-            }
+        APIAuth::from_token_store(tstore, &api_server, &ent, &user).or_else(|e| {
+            debug!("Ignoring {:?}\nRequesting token from config", e);
+            APIAuth::from_token_request(&config)
         })
     }
 
     pub fn from_token_store(tstore: TokenStore,
                             server: &str, ent: &str,
-                            user: &str) -> Result<APIAuth, DeliveryError> {
+                            user: &str) -> DeliveryResult<APIAuth> {
         match tstore.lookup(server, ent, user) {
             Some(token) => {
+                debug!("Token found");
                 Ok(APIAuth{ user: String::from(user),
                             token: token.clone()})
             },
             None => {
+                debug!("Token not found");
                 let msg = format!("server: {}, ent: {}, user: {}",
                                   server, ent, user);
                 Err(DeliveryError{ kind: Kind::NoToken,
                                    detail: Some(msg)})
             }
+        }
+    }
+
+    pub fn from_token_request(config: &Config) -> DeliveryResult<APIAuth> {
+        let user = try!(config.user());
+        let interactive = !config.non_interactive.unwrap_or(false);
+        if interactive {
+            let token = try!(TokenStore::request_token(&config));
+            debug!("APIAuth from_token_request: {:?}@{:?}", user, token);
+            Ok(APIAuth{ user: user.clone(), token: token.clone()})
+        } else {
+            let msg = format!("Unable to request token due to --no-interactive \
+                               flag.\nTry `delivery token` to create one");
+            Err(DeliveryError{ kind: Kind::NoToken, detail: Some(msg)})
         }
     }
 
@@ -414,9 +528,10 @@ mod tests {
 
     #[test]
     fn from_config_needs_user() {
-        let config = Config::default()
+        let mut config = Config::default()
             .set_enterprise("ncc-1701")
             .set_server("earth");
+        config.non_interactive = Some(true);
 
         match APIClient::from_config(&config) {
             Ok(_) => assert!(false),
@@ -434,19 +549,27 @@ mod tests {
         let tempdir = TempDir::new("t1").ok().expect("TempDir failed");
         let path = tempdir.path();
         let token_file = path.join_many(&["api-tokens"]);
-        let config = Config::default()
+        let mut config = Config::default()
             .set_enterprise("ncc-1701")
             .set_server("earth")
             .set_user("kirk")
             .set_token_file(token_file.to_str().unwrap());
+        config.non_interactive = Some(true);
 
         let mut tstore = TokenStore::from_file(&token_file).ok().expect("tstore sad");
         let write_result = tstore.write_token("earth", "ncc-1701", "kirk",
                                               "cafecafe");
         assert_eq!(true, write_result.is_ok());
 
-        let client = APIClient::from_config(&config).unwrap();
-        let url = client.api_url("foo");
+        // Turning this test into a verification instead since `from_config`
+        // now validatates that the token extracted from the tstore is valid.
+        // That means that it hits an endpoint and we can't mock it in this test.
+        let client = APIClient::from_config(&config);
+        assert!(client.is_err());
+
+        // Instead we use `from_config_no_auth` that doesn't validate the token
+        let client_from_store = APIClient::from_config_no_auth(&config).unwrap();
+        let url = client_from_store.api_url("foo");
         assert_eq!("https://earth/api/v0/e/ncc-1701/foo", url)
     }
 
@@ -518,11 +641,12 @@ mod tests {
         let tempdir = TempDir::new("t1").ok().expect("TempDir failed");
         let path = tempdir.path();
         let token_file = path.join_many(&["api-tokens"]);
-        let config = Config::default()
+        let mut config = Config::default()
             .set_enterprise("ncc-1701")
             .set_server("earth")
             .set_user("kirk")
             .set_token_file(token_file.to_str().unwrap());
+        config.non_interactive = Some(true);
 
         let mut tstore = TokenStore::from_file(&token_file).ok().expect("tstore sad");
         let write_result = tstore.write_token("earth", "ncc-1701", "kirk",
@@ -531,8 +655,15 @@ mod tests {
 
         let auth = APIAuth::from_config(&config);
 
+        // Turning this test into a verification instead since `from_config`
+        // now validatates that the token extracted from the tstore is valid.
+        // That means that it hits an endpoint and we can't mock it in this test.
+        assert!(auth.is_err());
+
+        // Instead we use `from_token_store` that doesn't validate the token
+        let auth_from_tstore = APIAuth::from_token_store(tstore, "earth", "ncc-1701", "kirk");
         assert_eq!(true,
-                   auth.and_then(|a| {
+                   auth_from_tstore.and_then(|a| {
                        assert_eq!("kirk", a.user());
                        assert_eq!("cafecafe", a.token());
                        Ok(a)
@@ -541,9 +672,10 @@ mod tests {
 
     #[test]
     fn api_auth_from_config_when_missing_test() {
-        let config = Config::default()
+        let mut config = Config::default()
             .set_enterprise("ncc-1701")
             .set_server("earth");
+        config.non_interactive = Some(true);
 
         // NOTE: for now, the use of the HOME environment variable
         // makes this test unsafe for parallel execution.

@@ -28,7 +28,7 @@ use std::io::prelude::*;
 use utils::path_join_many::PathJoinMany;
 use utils::path_ext::{is_dir, is_file};
 
-#[derive(RustcEncodable, Clone)]
+#[derive(RustcEncodable, Clone, Debug)]
 pub struct Config {
     pub server: Option<String>,
     pub api_port: Option<String>,
@@ -40,7 +40,11 @@ pub struct Config {
     pub git_port: Option<String>,
     pub pipeline: Option<String>,
     pub token_file: Option<String>,
-    pub non_interactive: Option<bool>
+    pub generator: Option<String>,
+    pub non_interactive: Option<bool>,
+    pub auto_bump: Option<bool>,
+    pub config_json: Option<String>,
+    pub saml: Option<bool>,
 }
 
 impl Default for Config {
@@ -56,7 +60,11 @@ impl Default for Config {
             git_port: Some(String::from("8989")),
             pipeline: Some(String::from("master")),
             token_file: None,
-            non_interactive: None
+            generator: None,
+            non_interactive: None,
+            auto_bump: None,
+            config_json: None,
+            saml: None,
         }
     }
 }
@@ -91,6 +99,8 @@ config_accessor_for!(project, set_project, "Project not set; try --project or se
 config_accessor_for!(git_port, set_git_port, "Git Port not set; please set it in your .toml config file");
 config_accessor_for!(pipeline, set_pipeline, "Pipeline not set; try --for or set it in your .toml config file");
 config_accessor_for!(token_file, set_token_file, "token_file not set; set it in your cli.toml");
+config_accessor_for!(generator, set_generator, "build_cookbook generator not set; set it in your cli.toml");
+config_accessor_for!(config_json, set_config_json, "config_json not set; set it in your cli.toml");
 
 impl Config {
 
@@ -179,7 +189,11 @@ impl Config {
         config.user = stringify_or("user", &table, config.user);
         config.git_port = stringify_or("git_port", &table, config.git_port);
         config.token_file = stringify_or("token_file", &table, config.token_file);
+        config.generator = stringify_or("generator", &table, config.generator);
         config.non_interactive = boolify_or("non_interactive", &table, config.non_interactive);
+        config.auto_bump = boolify_or("auto_bump", &table, config.auto_bump);
+        config.config_json = stringify_or("config_json", &table, config.config_json);
+        config.saml = boolify_or("saml", &table, config.saml);
         return Ok(config);
     }
 
@@ -265,7 +279,11 @@ mod tests {
                 assert_eq!(Some("master".to_string()), config.pipeline);
                 assert_eq!(None, config.organization);
                 assert_eq!(None, config.token_file);
+                assert_eq!(None, config.generator);
                 assert_eq!(None, config.non_interactive);
+                assert_eq!(None, config.auto_bump);
+                assert_eq!(None, config.config_json);
+                assert_eq!(None, config.saml);
             },
             Err(e) => {
                 panic!("Failed to parse: {:?}", e.detail)
@@ -284,6 +302,9 @@ mod tests {
             api_port = "7643"
             pipeline = "dev"
             non_interactive = true
+            auto_bump = true
+            config_json = "/path/to/my/custom/config.json"
+            saml = true
 "#;
         let config_result = Config::parse_config(toml);
         match config_result {
@@ -295,6 +316,10 @@ mod tests {
                 assert_eq!(Some(String::from("127.0.0.1")), config.server);
                 assert_eq!(None, config.organization);
                 assert_eq!(Some(true), config.non_interactive);
+                assert_eq!(Some(true), config.auto_bump);
+                assert_eq!(Some("/path/to/my/custom/config.json".to_string()),
+                          config.config_json);
+                assert_eq!(Some(true), config.saml);
             },
             Err(e) => {
                 panic!("Failed to parse: {:?}", e.detail)
